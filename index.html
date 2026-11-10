@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>カードバトル</title>
+<style>
+body { margin: 0; background: #12161f; color: #e8ecf3; font-family: "Hiragino Sans", "Yu Gothic UI", "Meiryo", sans-serif; }
+#gate { max-width: 420px; margin: 60px auto; padding: 24px; text-align: center; }
+#gate textarea { width: 100%; box-sizing: border-box; height: 110px; background: #1b2232; color: #e8ecf3; border: 1px solid #3a4560; border-radius: 6px; padding: 8px; font-family: monospace; font-size: 13px; }
+#gate button { margin-top: 12px; padding: 10px 28px; font-size: 15px; border-radius: 8px; border: 1px solid #5b80e0; background: #3a63c9; color: #fff; cursor: pointer; }
+#gmsg { margin-top: 10px; color: #ff9a8a; font-size: 14px; min-height: 20px; }
+</style>
+</head>
+<body>
+<div id="gate" hidden>
+  <h2>合言葉を入力してください</h2>
+  <textarea id="pw" placeholder="合言葉を貼り付け" autocomplete="off" spellcheck="false"></textarea>
+  <div><button id="go">入る</button></div>
+  <div id="gmsg"></div>
+</div>
+<div id="app"></div>
+<div id="detail" class="hidden"></div>
+<div id="toast"></div>
+<div id="modal" class="hidden"></div>
+<div id="cardinfo" class="hidden"></div>
+
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+<script src="game.enc.js"></script>
+<script>
+(async () => {
+  const KEY = 'cardgame_pass_v1';
+  const gate = document.getElementById('gate'), msg = document.getElementById('gmsg');
+  const raw = Uint8Array.from(atob(window.GAME_ENC), c => c.charCodeAt(0));
+  async function open(pw) {
+    const salt = raw.slice(0, 16), iv = raw.slice(16, 28), data = raw.slice(28);
+    const km = await crypto.subtle.importKey('raw', new TextEncoder().encode(pw), 'PBKDF2', false, ['deriveKey']);
+    const key = await crypto.subtle.deriveKey({ name: 'PBKDF2', salt, iterations: 100000, hash: 'SHA-256' }, km, { name: 'AES-GCM', length: 256 }, false, ['decrypt']);
+    const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, data);
+    return JSON.parse(new TextDecoder().decode(plain));
+  }
+  function run(bundle) {
+    gate.remove();
+    const st = document.createElement('style'); st.textContent = bundle.css; document.head.appendChild(st);
+    for (const code of bundle.js) { const s = document.createElement('script'); s.textContent = code; document.body.appendChild(s); }
+  }
+  async function attempt(pw, quiet) {
+    pw = (pw || '').replace(/\s+/g, '');
+    if (!pw) return false;
+    try {
+      const bundle = await open(pw);
+      try { localStorage.setItem(KEY, pw); } catch (e) {}
+      run(bundle); return true;
+    } catch (e) { if (!quiet) msg.textContent = '合言葉が違います'; return false; }
+  }
+  // リンクの # 以降に合言葉が付いていれば、それを使う（#以降はサーバーに送られない）
+  let fromHash = '';
+  if (location.hash.length > 1) {
+    try { fromHash = decodeURIComponent(location.hash.slice(1)); } catch (e) {}
+    history.replaceState(null, '', location.pathname + location.search);
+  }
+  let saved = ''; try { saved = localStorage.getItem(KEY) || ''; } catch (e) {}
+  if (await attempt(fromHash, true)) return;
+  if (await attempt(saved, true)) return;
+  gate.hidden = false;
+  document.getElementById('go').onclick = () => { msg.textContent = '確認中…'; attempt(document.getElementById('pw').value); };
+})();
+</script>
+</body>
+</html>
