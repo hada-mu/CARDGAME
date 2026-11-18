@@ -10,10 +10,17 @@ body { margin: 0; background: #12161f; color: #e8ecf3; font-family: "Hiragino Sa
 #gate { max-width: 420px; margin: 60px auto; padding: 24px; text-align: center; }
 #gate textarea { width: 100%; box-sizing: border-box; height: 110px; background: #1b2232; color: #e8ecf3; border: 1px solid #3a4560; border-radius: 6px; padding: 8px; font-family: monospace; font-size: 13px; }
 #gate button { margin-top: 12px; padding: 10px 28px; font-size: 15px; border-radius: 8px; border: 1px solid #5b80e0; background: #3a63c9; color: #fff; cursor: pointer; }
+#load { max-width: 420px; margin: 80px auto; padding: 24px; text-align: center; }
+#load .bar, #imgbar .bar { height: 8px; background: #2a3247; border-radius: 4px; overflow: hidden; margin-top: 10px; }
+#load .bar i, #imgbar .bar i { display: block; height: 100%; width: 0; background: #5b80e0; transition: width .2s; }
+#load small { color: #9aa6bd; }
+#imgbar { position: fixed; left: 8px; bottom: 8px; z-index: 9999; background: #12161fd9; color: #cfd6e4; font-size: 11px; padding: 6px 10px; border-radius: 8px; width: 160px; pointer-events: none; }
+#imgbar .bar { height: 5px; margin-top: 4px; }
 #gmsg { margin-top: 10px; color: #ff9a8a; font-size: 14px; min-height: 20px; }
 </style>
 </head>
 <body>
+<div id="load"><h2>読み込み中…</h2><div id="lmsg"><small>はじめての時や更新があった時は、少し時間がかかります</small></div><div class="bar"><i id="lbar"></i></div><div id="lpct"><small>0%</small></div></div>
 <div id="gate" hidden>
   <h2>合言葉を入力してください</h2>
   <textarea id="pw" placeholder="合言葉を貼り付け" autocomplete="off" spellcheck="false"></textarea>
@@ -29,31 +36,89 @@ body { margin: 0; background: #12161f; color: #e8ecf3; font-family: "Hiragino Sa
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
-<script src="game.enc.js"></script>
 <script>
 (async () => {
   const KEY = 'cardgame_pass_v1';
-  const gate = document.getElementById('gate'), msg = document.getElementById('gmsg');
-  const raw = Uint8Array.from(atob(window.GAME_ENC), c => c.charCodeAt(0));
-  async function open(pw) {
-    const salt = raw.slice(0, 16), iv = raw.slice(16, 28), data = raw.slice(28);
+  const gate = document.getElementById('gate'), msg = document.getElementById('gmsg'), load = document.getElementById('load');
+  const setBar = (p, txt) => { document.getElementById('lbar').style.width = p + '%'; document.getElementById('lpct').innerHTML = '<small>' + txt + '</small>'; };
+  // ---- 端末への保存（IndexedDB）。暗号化されたまま保存する ----
+  const DB = (() => { let p = null; const open = () => p || (p = new Promise((res, rej) => { if (!window.indexedDB) return rej(new Error('no idb')); const r = indexedDB.open('cardgame_cache', 1); r.onupgradeneeded = () => r.result.createObjectStore('files'); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }));
+    // 端末によっては保存が使えなかったり止まったりするので、2秒で諦めて普通にダウンロードする
+    const lim = (pr, v) => Promise.race([pr, new Promise(res => setTimeout(() => res(v), 2000))]);
+    return {
+      get: k => lim((async () => { try { const db = await open(); return await new Promise(res => { const q = db.transaction('files').objectStore('files').get(k); q.onsuccess = () => res(q.result || null); q.onerror = () => res(null); }); } catch (e) { return null; } })(), null),
+      put: (k, v) => lim((async () => { try { const db = await open(); await new Promise(res => { const t = db.transaction('files', 'readwrite'); t.objectStore('files').put(v, k); t.oncomplete = res; t.onerror = res; t.onabort = res; }); } catch (e) { } })(), null),
+    }; })();
+  // ---- 進み具合つきダウンロード ----
+  async function download(url, size, onp) {
+    const r = await fetch(url, { cache: 'no-store' });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const total = +r.headers.get('content-length') || size || 0;
+    if (!r.body || !r.body.getReader) { const b = await r.arrayBuffer(); onp(1, b.byteLength, b.byteLength); return b; }
+    const rd = r.body.getReader(), parts = []; let got = 0;
+    for (;;) { const { done, value } = await rd.read(); if (done) break; parts.push(value); got += value.length; onp(total ? Math.min(0.99, got / total) : 0, got, total); }
+    const buf = new Uint8Array(got); let o = 0; for (const p of parts) { buf.set(p, o); o += p.length; }
+    onp(1, got, total); return buf.buffer;
+  }
+  // 新しい版があればダウンロード、なければ端末に保存した分を使う
+  let ver = null;
+  try { const r = await fetch('version.json?t=' + Date.now(), { cache: 'no-store' }); if (r.ok) ver = await r.json(); } catch (e) { }
+  async function getFile(name, onp) {
+    const cached = await DB.get(name);
+    if (cached && (!ver || cached.v === ver[name])) { onp(1, 0, 0, true); return cached.bytes; }
+    if (!ver) throw new Error('offline');
+    let bytes;
+    try { bytes = await download(name + '.bin?v=' + ver[name], ver[name + 'Size'], onp); }
+    catch (e) { if (cached) { onp(1, 0, 0, true); return cached.bytes; } throw e; }
+    DB.put(name, { v: ver[name], bytes });
+    return bytes;
+  }
+  const MB = n => (n / 1048576).toFixed(1) + 'MB';
+  let gameBytes;
+  try {
+    gameBytes = await getFile('game', (p, got, total, hit) => setBar(Math.round(p * 100), hit ? '端末に保存した分を使います' : Math.round(p * 100) + '%（' + MB(got) + (total ? ' / ' + MB(total) : '') + '）'));
+  } catch (e) {
+    document.getElementById('lmsg').innerHTML = '<span style="color:#ff9a8a">読み込めませんでした。通信のよい所で、ページを再読み込みしてください。</span>'; return;
+  }
+  // ---- 復号（鍵は1回だけ作る） ----
+  let keyCache = null;
+  async function keyFor(pw, salt) {
+    const sk = pw + ':' + Array.from(salt).join(',');
+    if (keyCache && keyCache.sk === sk) return keyCache.key;
     const km = await crypto.subtle.importKey('raw', new TextEncoder().encode(pw), 'PBKDF2', false, ['deriveKey']);
     const key = await crypto.subtle.deriveKey({ name: 'PBKDF2', salt, iterations: 100000, hash: 'SHA-256' }, km, { name: 'AES-GCM', length: 256 }, false, ['decrypt']);
-    const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, data);
+    keyCache = { sk, key }; return key;
+  }
+  async function decrypt(bytes, pw) {
+    const raw = new Uint8Array(bytes), salt = raw.slice(0, 16), iv = raw.slice(16, 28), data = raw.slice(28);
+    const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, await keyFor(pw, salt), data);
     return JSON.parse(new TextDecoder().decode(plain));
   }
-  function run(bundle) {
-    gate.remove();
+  // ---- 画像はゲームが始まってから読み込み、届いたら表示中のカードにも絵を入れる ----
+  async function loadImages(pw) {
+    const box = document.createElement('div'); box.id = 'imgbar'; box.innerHTML = 'カードの絵を読み込み中… <span>0%</span><div class="bar"><i></i></div>';
+    let shown = false; const show = () => { if (!shown) { document.body.appendChild(box); shown = true; } };
+    try {
+      const bytes = await getFile('img', (p, got, total, hit) => { if (hit) return; show(); box.querySelector('span').textContent = Math.round(p * 100) + '%'; box.querySelector('i').style.width = Math.round(p * 100) + '%'; });
+      const im = await decrypt(bytes, pw);
+      window.CARD_IMAGES = im.base || {}; window.CARD_IMAGES_USER = im.user || {};
+      window.dispatchEvent(new Event('cardimages'));
+      box.remove();
+    } catch (e) { show(); box.innerHTML = 'カードの絵を読み込めませんでした（再読み込みで再挑戦）'; setTimeout(() => box.remove(), 6000); }
+  }
+  function run(bundle, pw) {
+    gate.remove(); load.remove();
     const st = document.createElement('style'); st.textContent = bundle.css; document.head.appendChild(st);
     for (const code of bundle.js) { const s = document.createElement('script'); s.textContent = code; document.body.appendChild(s); }
+    loadImages(pw);
   }
   async function attempt(pw, quiet) {
     pw = (pw || '').replace(/\s+/g, '');
     if (!pw) return false;
     try {
-      const bundle = await open(pw);
+      const bundle = await decrypt(gameBytes, pw);
       try { localStorage.setItem(KEY, pw); } catch (e) {}
-      run(bundle); return true;
+      run(bundle, pw); return true;
     } catch (e) { if (!quiet) msg.textContent = '合言葉が違います'; return false; }
   }
   // リンクの # 以降に合言葉が付いていれば、それを使う（#以降はサーバーに送られない）
@@ -65,6 +130,7 @@ body { margin: 0; background: #12161f; color: #e8ecf3; font-family: "Hiragino Sa
   let saved = ''; try { saved = localStorage.getItem(KEY) || ''; } catch (e) {}
   if (await attempt(fromHash, true)) return;
   if (await attempt(saved, true)) return;
+  load.remove();
   gate.hidden = false;
   document.getElementById('go').onclick = () => { msg.textContent = '確認中…'; attempt(document.getElementById('pw').value); };
 })();
