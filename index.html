@@ -91,7 +91,12 @@ body { margin: 0; background: #12161f; color: #e8ecf3; font-family: "Hiragino Sa
   }
   async function decrypt(bytes, pw) {
     const raw = new Uint8Array(bytes), salt = raw.slice(0, 16), iv = raw.slice(16, 28), data = raw.slice(28);
-    const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, await keyFor(pw, salt), data);
+    let plain = new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, await keyFor(pw, salt), data));
+    // 圧縮した画像と、端末に残っている旧形式のキャッシュの両方を読める。
+    if (plain[0] === 0x1f && plain[1] === 0x8b) {
+      const stream = new Blob([plain]).stream().pipeThrough(new DecompressionStream('gzip'));
+      plain = new Uint8Array(await new Response(stream).arrayBuffer());
+    }
     return JSON.parse(new TextDecoder().decode(plain));
   }
   // ---- 画像はゲームが始まってから読み込み、届いたら表示中のカードにも絵を入れる ----
